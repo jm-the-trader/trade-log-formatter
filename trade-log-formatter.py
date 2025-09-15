@@ -606,31 +606,20 @@ def update_master_sheet(consolidated_trades, folder_path):
                     "Exit Time", "Exit Date"
                 ])
             
-            # Get Raw Trades sheet (formerly Trades)
+            # Get Raw Trades sheet
             if 'Raw Trades' in all_sheets:
                 df_raw_trades = all_sheets['Raw Trades'].copy()
-                # Ensure we only keep the columns we want, in the right order
-                desired_columns = ["Symbol", "Quantity", "Side", "Price", "Time", "Date"]
-                # Keep only columns that exist and in our desired order
-                existing_columns = [col for col in desired_columns if col in df_raw_trades.columns]
-                df_raw_trades = df_raw_trades[existing_columns]
-            elif 'Trades' in all_sheets and 'Symbol' in all_sheets['Trades'].columns and 'Date' in all_sheets['Trades'].columns:
-                # This is the old "Trades" sheet that should be "Raw Trades"
-                df_raw_trades = all_sheets['Trades'].copy()
-                # Reorder columns if they exist
-                if all(col in df_raw_trades.columns for col in ["Symbol", "Quantity", "Side", "Price", "Time", "Date"]):
-                    df_raw_trades = df_raw_trades[["Symbol", "Quantity", "Price", "Time", "Date"]]
             else:
                 df_raw_trades = pd.DataFrame(columns=[
                     "Symbol", "Quantity", "Side", "Price", "Time", "Date"
                 ])
         
-            # Get Consolidated Trades sheet
+            # Get Consolidated Trades sheet with correct column order
             if 'Consolidated Trades' in all_sheets:
                 df_consolidated = all_sheets['Consolidated Trades'].copy()
             else:
                 df_consolidated = pd.DataFrame(columns=[
-                    "Symbol", "Quantity", "Side", "Avg_Price", "Processed"
+                    "Symbol", "Quantity", "Side", "Avg_Price", "Time", "Processed"
                 ])
                 
         else:
@@ -641,10 +630,10 @@ def update_master_sheet(consolidated_trades, folder_path):
                 "Exit Time", "Exit Date"
             ])
             df_raw_trades = pd.DataFrame(columns=[
-                "Symbol", "Quantity", "Price", "Time", "Date"
+                "Symbol", "Quantity", "Side", "Price", "Time", "Date"
             ])
             df_consolidated = pd.DataFrame(columns=[
-                "Symbol", "Date", "Time", "Side", "Quantity", "Avg_Price", "Total_Value"
+                "Symbol", "Quantity", "Side", "Avg_Price", "Time", "Processed"
             ])
         
         print(f"📊 Current data before processing:")
@@ -721,10 +710,13 @@ def update_master_sheet(consolidated_trades, folder_path):
                 print(f"⚠️ Warning: No 'Side' or 'Type' column found in Consolidated Trades. Available columns: {list(df_consolidated.columns)}")
                 df_consolidated['trade_key'] = ''
             
-            if 'trade_key' not in df_consolidated.columns:
+            if 'trade_key' not in df_consolidated.columns and side_col:
+                # Use the correct column name - should match the consolidated_trade_key format
+                # consolidated_trade_key = f"{trade['Symbol']}_{trade['Date']}_{trade['Side']}"
+                date_col = 'Processed' if 'Processed' in df_consolidated.columns else 'Date'
                 df_consolidated['trade_key'] = (
                     df_consolidated['Symbol'].astype(str) + '_' + 
-                    df_consolidated['Processed'].astype(str) + '_' + 
+                    df_consolidated[date_col].astype(str) + '_' + 
                     df_consolidated[side_col].astype(str)
                 )
         
@@ -769,20 +761,28 @@ def update_master_sheet(consolidated_trades, folder_path):
                     "Side": trade['Side'],
                     "total_qty": 0,
                     "total_value": 0,
-                    "time": trade['Time']  # Initialize with first trade's time
+                    "time": trade['Time']  # Make sure this is the actual time, not None
                 }
             
             group = consolidated_by_day[consolidated_trade_key]
             group['total_qty'] += trade['Quantity']
             group['total_value'] += trade['Quantity'] * trade['Price']
             
-            # Update time based on trade side:
-            # LONG: keep earliest time
-            # SHORT: keep latest time
-            if trade['Side'] == 'LONG':
-                group['time'] = min(group['time'], trade['Time'])
-            else:  # SHORT
-                group['time'] = max(group['time'], trade['Time'])
+            # Update time based on trade side - ensure we're not getting None/NaN
+            current_time = trade['Time']
+            if current_time and str(current_time) != 'nan':
+                # LONG: keep earliest time
+                # SHORT: keep latest time
+                if trade['Side'] == 'LONG':
+                    if group['time'] and str(group['time']) != 'nan':
+                        group['time'] = min(group['time'], current_time)
+                    else:
+                        group['time'] = current_time
+                else:  # SHORT
+                    if group['time'] and str(group['time']) != 'nan':
+                        group['time'] = max(group['time'], current_time)
+                    else:
+                        group['time'] = current_time
             
             # Add LONG positions to master sheet for position tracking
             if trade['Side'] in ['BUY', 'LONG']:
@@ -819,7 +819,8 @@ def update_master_sheet(consolidated_trades, folder_path):
                     "Quantity": group['total_qty'],
                     "Side": group['Side'],
                     "Avg_Price": avg_price,
-                    "Processed": pd.to_datetime(group['Date']).strftime('%Y-%m-%d')  # Using Date as Processed
+                    "Time": group['time'],  # Make sure time is included
+                    "Processed": pd.to_datetime(group['Date']).strftime('%Y-%m-%d')
                 }
                 
                 new_consolidated_trades.append(new_consolidated_trade)
@@ -881,11 +882,24 @@ def update_master_sheet(consolidated_trades, folder_path):
         # Sort consolidated trades sheet by date
         # Create unique identifier for existing consolidated trades
         if not df_consolidated.empty:
-            df_consolidated['trade_key'] = (
-                df_consolidated['Symbol'].astype(str) + '_' + 
-                df_consolidated['Date'].astype(str) + '_' + 
-                df_consolidated['Side'].astype(str)
-            )
+            # Check for Side column more carefully
+            if 'Side' in df_consolidated.columns:
+                side_col = 'Side'
+            elif 'Type' in df_consolidated.columns:
+                side_col = 'Type'
+            else:
+                print(f"⚠️ Warning: No 'Side' or 'Type' column found in Consolidated Trades. Available columns: {list(df_consolidated.columns)}")
+                df_consolidated['trade_key'] = ''
+            
+            if 'trade_key' not in df_consolidated.columns and side_col:
+                # Use the correct column name - should match the consolidated_trade_key format
+                # consolidated_trade_key = f"{trade['Symbol']}_{trade['Date']}_{trade['Side']}"
+                date_col = 'Processed' if 'Processed' in df_consolidated.columns else 'Date'
+                df_consolidated['trade_key'] = (
+                    df_consolidated['Symbol'].astype(str) + '_' + 
+                    df_consolidated[date_col].astype(str) + '_' + 
+                    df_consolidated[side_col].astype(str)
+                )
         # Save updated master file with proper sheet names
         with pd.ExcelWriter(master_file, engine='openpyxl') as writer:
             df_master.to_excel(writer, sheet_name='Trades', index=False)  # Position tracking
@@ -989,7 +1003,7 @@ def reset_master_sheet():
         ])
         
         df_consolidated = pd.DataFrame(columns=[
-            "Symbol", "Quantity", "Side", "Avg_Price", "Processed"
+            "Symbol", "Quantity", "Side", "Avg_Price", "Time", "Processed"
         ])
         
         # Save empty master file
