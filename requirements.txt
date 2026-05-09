@@ -1,5 +1,4 @@
-fitz==0.0.1.dev2  # Base PyMuPDF requirement
-PyMuPDF==1.25.5   # PDF processing
+PyMuPDF>=1.22.3
 python-dateutil==2.8.2
 pandas
 openpyxl

@@ -4,7 +4,7 @@ import json
 import os
 from datetime import datetime, timedelta
 from glob import glob
-import fitz  # PyMuPDF for PDF processing
+import pymupdf as fitz  # PyMuPDF >= 1.25 uses pymupdf import
 import csv
 
 # Configuration
@@ -19,7 +19,7 @@ DEFAULT_TEST_DATE = "06.2025" if TEST_MODE else datetime.now().strftime("%m.%Y")
 MASTER_FILE = "master-copy-test.xlsx" if TEST_MODE else "master-trades.xlsx"
 MASTER_BACKUP = "master-copy-test-backup.xlsx" if TEST_MODE else "master-copy-backup.xlsx"
 PROCESSED_FILE = "processed_files_test.json" if TEST_MODE else "processed_files.json"
-BASE_PATH = "/Users/michaeljacinto/Library/CloudStorage/OneDrive-Personal/Desktop/trades"
+BASE_PATH_TRADES = "/Users/michaeljacinto/Library/CloudStorage/OneDrive-Personal/Desktop - onedrive/trades"
 
 def debug_print(*args, **kwargs):
     """Wrapper for debug printing"""
@@ -34,7 +34,7 @@ def get_folder_path(date_str):
         target_folder = target_date.strftime("%m.%Y")
         
         # Look for exact month folder
-        folder_path = os.path.join(BASE_PATH, target_folder)
+        folder_path = os.path.join(BASE_PATH_TRADES, target_folder)
         
         if os.path.exists(folder_path) and os.path.isdir(folder_path):
             debug_print(f"Found matching folder: {target_folder}")
@@ -381,7 +381,7 @@ def consolidate_trades(trades):
 def check_open_positions(folder_path):
     """Check master copy for open positions and provide summary with totals"""
     try:
-        master_file = os.path.join("/Users/michaeljacinto/Library/CloudStorage/OneDrive-Personal/Desktop/trades", MASTER_FILE)
+        master_file = os.path.join(BASE_PATH_TRADES, MASTER_FILE)
         df = pd.read_excel(master_file)
         
         # Find rows where Exit Qty or Exit Price is empty/NaN
@@ -449,128 +449,200 @@ def check_open_positions(folder_path):
         print(f"\n❌ Error reading master copy: {str(e)}")
         return []
 
+def _is_blank(v):
+    """True if value is None, NaN, or empty string."""
+    if v is None:
+        return True
+    if isinstance(v, str) and v.strip() == '':
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def _row_state(row):
+    """Categorize a master row: 'closed', 'legacy_partial', or 'open'."""
+    eq_blank = _is_blank(row.get('Exit Qty'))
+    ed_blank = _is_blank(row.get('Exit Date'))
+    if not eq_blank and not ed_blank:
+        return 'closed'
+    if not eq_blank and ed_blank:
+        return 'legacy_partial'
+    return 'open'
+
+
 def match_trades_fifo(df_master, consolidated_trades):
-    """Match trades using FIFO method with running balance"""
-    positions = {}  # {symbol: {'qty': net_qty, 'trades': []}}
-    
-    # Process trades in chronological order - this is crucial!
+    """Match new consolidated trades against existing master rows using FIFO.
+
+    Existing rows fall into three buckets:
+      - closed:         Exit Qty + Exit Date both filled. Left untouched.
+      - legacy_partial: Exit Qty filled but Exit Date blank. New closes are
+                        weighted-averaged into Exit Qty/Price; Exit Date is
+                        set to the final fill date once fully closed.
+      - open:           Exit Qty blank. Approach B (split-on-close): a partial
+                        close splits the row into a closed lot of size `fill`
+                        and a remaining open row of size `qty - fill`.
+
+    Any new trade quantity that doesn't match an opposite-side open row
+    becomes a new open BUY/SELL row.
+    """
+    columns = [
+        "Symbol", "Qty", "Side", "Entry Price", "Entry Time",
+        "Entry Date", "Notes", "Exit Qty", "Exit Price",
+        "Exit Time", "Exit Date",
+    ]
+
+    if df_master is None or df_master.empty:
+        rows = []
+    else:
+        df_clean = df_master[[c for c in columns if c in df_master.columns]].copy()
+        for c in columns:
+            if c not in df_clean.columns:
+                df_clean[c] = None
+        rows = df_clean.to_dict('records')
+
+    # Normalize legacy 'LONG'/'SHORT' to 'BUY'/'SELL' for the master sheet.
+    for r in rows:
+        if r.get('Side') == 'LONG':
+            r['Side'] = 'BUY'
+        elif r.get('Side') == 'SHORT':
+            r['Side'] = 'SELL'
+
+    def entry_dt(r):
+        try:
+            return pd.to_datetime(f"{r.get('Entry Date')} {r.get('Entry Time')}", errors='coerce')
+        except Exception:
+            return pd.NaT
+
+    from collections import defaultdict
+    queues = defaultdict(list)
+    indexed = sorted(
+        enumerate(rows),
+        key=lambda ir: (entry_dt(ir[1]) if not pd.isna(entry_dt(ir[1])) else pd.Timestamp.max),
+    )
+    for i, r in indexed:
+        if _row_state(r) in ('open', 'legacy_partial'):
+            queues[r['Symbol']].append(i)
+
     trades = sorted(consolidated_trades, key=lambda x: (x['Date'], x['Time']))
     print("\n🔄 Matching trades using FIFO method...")
-    print("\nTrades to process:")
-    print(json.dumps(trades, indent=2, default=str))
 
     for trade in trades:
         symbol = trade['Symbol']
-        side = trade['Side']  # This is now 'LONG' or 'SHORT' after consolidate_trades
-        qty = trade['Quantity']
-        price = trade['Price']
+        side = trade['Side']  # 'LONG' or 'SHORT' after consolidate_trades
+        qty = abs(int(trade['Quantity']))
+        price = float(trade['Price'])
         time = trade['Time']
         date = trade['Date']
-        
-        if symbol not in positions:
-            positions[symbol] = {'qty': 0, 'trades': []}
-        
-        curr_pos = positions[symbol]
-        print(f"\n📊 Processing {side} {qty} {symbol} @ ${price:.2f}")
-        print(f"  Current {symbol} balance: {curr_pos['qty']}")
-        
-        if side == 'LONG':  # This handles BUY orders
-            remaining_qty = qty
-            
-            # First try to cover SHORT positions (negative balance)
-            if curr_pos['qty'] < 0:
-                cover_qty = min(qty, abs(curr_pos['qty']))
-                
-                # Find open SHORT positions to close
-                for pos in reversed(curr_pos['trades']):
-                    if pos['Side'] == 'SELL' and (pos['Exit Qty'] is None or pd.isna(pos['Exit Qty'])) and cover_qty > 0:
-                        pos_cover = min(cover_qty, abs(pos['Qty']))
-                        pos['Exit Qty'] = pos_cover
-                        pos['Exit Price'] = price
-                        pos['Exit Time'] = time
-                        pos['Exit Date'] = date
-                        cover_qty -= pos_cover
-                        remaining_qty -= pos_cover
-                        print(f"  → Covered {pos_cover} shares of SHORT position")
-                        if cover_qty == 0:
-                            break
-            
-            # Update running balance
-            curr_pos['qty'] += qty
-            
-            # Add new LONG position if there's remaining quantity
-            if remaining_qty > 0:
-                new_trade = {
-                    'Symbol': symbol,
-                    'Qty': remaining_qty,
-                    'Side': 'BUY',
-                    'Entry Price': price,
-                    'Entry Time': time,
-                    'Entry Date': date,
-                    'Notes': '',
-                    'Exit Qty': None,
-                    'Exit Price': None,
-                    'Exit Time': None,
-                    'Exit Date': None
-                }
-                curr_pos['trades'].append(new_trade)
-                print(f"  → Added LONG position of {remaining_qty} shares")
-            
-        elif side == 'SHORT':  # This handles SELL orders
-            remaining_sell = qty
-            
-            # First try to close existing LONG positions
-            for pos in curr_pos['trades']:
-                if pos['Side'] == 'BUY' and (pos['Exit Qty'] is None or pd.isna(pos['Exit Qty'])) and remaining_sell > 0:
-                    pos_close = min(remaining_sell, pos['Qty'])
-                    pos['Exit Qty'] = -pos_close
-                    pos['Exit Price'] = price
-                    pos['Exit Time'] = time
-                    pos['Exit Date'] = date
-                    remaining_sell -= pos_close
-                    print(f"  → Closed {pos_close} shares of LONG position")
-            
-            # Update running balance
-            curr_pos['qty'] -= qty
-            
-            # If there's still quantity to sell, create new SHORT position
-            if remaining_sell > 0:
-                new_trade = {
-                    'Symbol': symbol,
-                    'Qty': -remaining_sell,
-                    'Side': 'SELL',
-                    'Entry Price': price,
-                    'Entry Time': time,
-                    'Entry Date': date,
-                    'Notes': '',
-                    'Exit Qty': None,
-                    'Exit Price': None,
-                    'Exit Time': None,
-                    'Exit Date': None
-                }
-                curr_pos['trades'].append(new_trade)
-                print(f"  → Added SHORT position of {remaining_sell} shares")
-        
-        print(f"  → New {symbol} balance: {curr_pos['qty']}")
-    
-    # Convert all trades back to DataFrame
-    all_trades = []
-    for symbol_trades in positions.values():
-        all_trades.extend(symbol_trades['trades'])
-    
-    # Sort by date and time
-    df_result = pd.DataFrame(all_trades)
+
+        if qty == 0:
+            continue
+
+        # LONG (BUY) closes open SELL rows; remainder opens BUY.
+        # SHORT (SELL) closes open BUY rows; remainder opens SELL.
+        match_side = 'SELL' if side == 'LONG' else 'BUY'
+        new_row_side = 'BUY' if side == 'LONG' else 'SELL'
+        new_row_qty_sign = 1 if new_row_side == 'BUY' else -1
+        # Exit Qty has opposite sign of the closed row's Qty.
+        exit_qty_sign = -1 if match_side == 'BUY' else 1
+
+        remaining = qty
+        q = queues[symbol]
+        print(f"\n📊 {side} {qty} {symbol} @ ${price:.2f}")
+
+        i_idx = 0
+        while remaining > 0 and i_idx < len(q):
+            r = rows[q[i_idx]]
+            if r['Side'] != match_side:
+                i_idx += 1
+                continue
+
+            state = _row_state(r)
+            row_qty = abs(int(r['Qty']))
+
+            if state == 'legacy_partial':
+                existing_eq = abs(float(r['Exit Qty']))
+                existing_ep = float(r['Exit Price'])
+                room = row_qty - existing_eq
+                if room <= 0:
+                    r['Exit Date'] = date
+                    if _is_blank(r.get('Exit Time')):
+                        r['Exit Time'] = time
+                    q.pop(i_idx)
+                    continue
+                fill = min(remaining, room)
+                new_eq = existing_eq + fill
+                new_ep = (existing_eq * existing_ep + fill * price) / new_eq
+                r['Exit Qty'] = exit_qty_sign * new_eq
+                r['Exit Price'] = new_ep
+                r['Exit Time'] = time
+                if new_eq >= row_qty:
+                    r['Exit Date'] = date  # final fill date
+                    q.pop(i_idx)
+                else:
+                    i_idx += 1
+                remaining -= fill
+                print(f"  → legacy avg-close {fill} ({symbol}) → exit_qty={new_eq}")
+
+            elif state == 'open':
+                fill = min(remaining, row_qty)
+                if fill >= row_qty:
+                    r['Exit Qty'] = exit_qty_sign * fill
+                    r['Exit Price'] = price
+                    r['Exit Time'] = time
+                    r['Exit Date'] = date
+                    q.pop(i_idx)
+                    print(f"  → closed full lot {fill} {symbol}")
+                else:
+                    row_sign = 1 if r['Side'] == 'BUY' else -1
+                    closed_lot = dict(r)
+                    closed_lot['Qty'] = row_sign * fill
+                    closed_lot['Exit Qty'] = exit_qty_sign * fill
+                    closed_lot['Exit Price'] = price
+                    closed_lot['Exit Time'] = time
+                    closed_lot['Exit Date'] = date
+                    rows.append(closed_lot)
+                    r['Qty'] = row_sign * (row_qty - fill)
+                    print(f"  → split lot {symbol}: closed {fill}, {row_qty - fill} still open")
+                remaining -= fill
+            else:
+                i_idx += 1
+
+        if remaining > 0:
+            new_row = {
+                'Symbol': symbol,
+                'Qty': new_row_qty_sign * remaining,
+                'Side': new_row_side,
+                'Entry Price': price,
+                'Entry Time': time,
+                'Entry Date': date,
+                'Notes': '',
+                'Exit Qty': None,
+                'Exit Price': None,
+                'Exit Time': None,
+                'Exit Date': None,
+            }
+            new_idx = len(rows)
+            rows.append(new_row)
+            queues[symbol].append(new_idx)
+            print(f"  → opened new {new_row_side} {remaining} {symbol}")
+
+    df_result = pd.DataFrame(rows, columns=columns)
     if not df_result.empty:
-        # Convert both date and time to string before concatenating
-        df_result['datetime'] = pd.to_datetime(df_result['Entry Date'].astype(str) + ' ' + df_result['Entry Time'].astype(str))
-        df_result = df_result.sort_values('datetime').drop('datetime', axis=1)
-    
+        df_result['_dt'] = pd.to_datetime(
+            df_result['Entry Date'].astype(str) + ' ' + df_result['Entry Time'].astype(str),
+            format='mixed', errors='coerce',
+        )
+        df_result = df_result.sort_values('_dt', kind='stable').drop(columns='_dt').reset_index(drop=True)
     return df_result
 
 def update_master_sheet(consolidated_trades, folder_path):
     """Update master balance sheet with new trades after backing up"""
     try:
-        BASE_PATH = "/Users/michaeljacinto/Library/CloudStorage/OneDrive-Personal/Desktop/trades"
+        BASE_PATH = BASE_PATH_TRADES
         master_file = os.path.join(BASE_PATH, MASTER_FILE)
         backup_file = os.path.join(BASE_PATH, MASTER_BACKUP)
         
@@ -721,7 +793,6 @@ def update_master_sheet(consolidated_trades, folder_path):
                 )
         
         # Track new trades for all sheets
-        new_position_trades = []
         new_raw_trades = []
         
         # Group consolidated trades by symbol, date, and side for the consolidated sheet
@@ -784,24 +855,9 @@ def update_master_sheet(consolidated_trades, folder_path):
                     else:
                         group['time'] = current_time
             
-            # Add LONG positions to master sheet for position tracking
-            if trade['Side'] in ['BUY', 'LONG']:
-                # Check if trade already exists in master
-                if df_master.empty or position_trade_key not in df_master['trade_key'].values:
-                    new_trade = {
-                        "Symbol": trade['Symbol'],
-                        "Qty": trade['Quantity'],
-                        "Side": 'LONG',
-                        "Entry Price": trade['Price'],
-                        "Entry Time": trade['Time'],
-                        "Entry Date": pd.to_datetime(trade['Date']).strftime('%Y-%m-%d'),
-                        "Notes": "",
-                        "Exit Qty": None,
-                        "Exit Price": None,
-                        "Exit Time": None,
-                        "Exit Date": None
-                    }
-                    new_position_trades.append(new_trade)
+            # Note: Trades sheet (position tracking) is built by match_trades_fifo
+            # below — it handles entries, FIFO closes, and split-on-partial. We
+            # intentionally do not pre-append entries here.
         
         # Create new consolidated trades for the consolidated sheet
         new_consolidated_trades = []
@@ -825,53 +881,23 @@ def update_master_sheet(consolidated_trades, folder_path):
                 
                 new_consolidated_trades.append(new_consolidated_trade)
         
-        # APPEND new trades to respective DataFrames (not replace)
-        if new_position_trades:
-            df_new_positions = pd.DataFrame(new_position_trades)
-            df_master = pd.concat([df_master, df_new_positions], ignore_index=True)
-        
         if new_raw_trades:
             df_new_raw = pd.DataFrame(new_raw_trades)
             df_raw_trades = pd.concat([df_raw_trades, df_new_raw], ignore_index=True)
-        
+
         if new_consolidated_trades:
             df_new_consolidated = pd.DataFrame(new_consolidated_trades)
             df_consolidated = pd.concat([df_consolidated, df_new_consolidated], ignore_index=True)
-        
-        # Drop the temporary trade_key columns before saving
+
+        # Drop temporary trade_key columns before saving
         df_master = df_master.drop('trade_key', axis=1, errors='ignore')
         df_raw_trades = df_raw_trades.drop('trade_key', axis=1, errors='ignore')
         df_consolidated = df_consolidated.drop('trade_key', axis=1, errors='ignore')
-        
-        # Match SELL trades to open positions using FIFO
+
+        # Run FIFO: matches new closes against existing open lots (handling
+        # legacy partials and split-on-close) and creates new open rows for
+        # the remainder. Operates on the existing master rows directly.
         df_master = match_trades_fifo(df_master, consolidated_trades)
-        
-        # Standardize column names for master sheet
-        if not df_master.empty:
-            # Map old column names to new ones if they exist
-            column_mapping = {
-                'Quantity': 'Qty',
-                'Type': 'Side',
-                'Price': 'Entry Price',
-                'Time': 'Entry Time',
-                'Date': 'Entry Date'
-            }
-            
-            for old_name, new_name in column_mapping.items():
-                if old_name in df_master.columns and new_name not in df_master.columns:
-                    df_master = df_master.rename(columns={old_name: new_name})
-        
-        # Final sort and cleanup for master sheet
-        if not df_master.empty:
-            # Convert time to string before concatenating, using mixed format for flexibility
-            df_master['datetime'] = pd.to_datetime(df_master['Entry Date'].astype(str) + ' ' + df_master['Entry Time'].astype(str), format='mixed', errors='coerce')
-            df_master = df_master.sort_values('datetime').drop('datetime', axis=1)
-            
-            # Remove any duplicate rows
-            df_master = df_master.drop_duplicates(
-                subset=['Symbol', 'Qty', 'Side', 'Entry Price', 'Entry Time', 'Entry Date'],
-                keep='first'
-            )
         
         # Sort raw trades sheet by date and time
         if not df_raw_trades.empty:
@@ -909,7 +935,7 @@ def update_master_sheet(consolidated_trades, folder_path):
         parent_dir = os.path.basename(os.path.dirname(master_file))
         filename = os.path.basename(master_file)
         print(f"✅ Updated {parent_dir}/{filename}:")
-        print(f"   - Added {len(new_position_trades)} new positions to 'Trades' sheet")
+        print(f"   - 'Trades' sheet now {len(df_master)} rows (FIFO matched)")
         print(f"   - Added {len(new_raw_trades)} new trades to 'Raw Trades' sheet")
         print(f"   - Added {len(new_consolidated_trades)} new entries to 'Consolidated Trades' sheet")
         print(f"📊 Final data after processing:")
@@ -947,7 +973,7 @@ def manage_processed_files(folder_path, pdf_file=None, check_only=False):
 def reset_test_files(folder_path):
     """Reset test files before running script"""
     if TEST_MODE:
-        BASE_PATH = "/Users/michaeljacinto/Library/CloudStorage/OneDrive-Personal/Desktop/trades"
+        BASE_PATH = BASE_PATH_TRADES
         
         # Reset processed files JSON
         test_json_path = os.path.join(folder_path, PROCESSED_FILE)
@@ -969,7 +995,7 @@ def reset_test_files(folder_path):
 def reset_master_sheet():
     """Reset all spreadsheets and processed files tracking"""
     try:
-        BASE_PATH = "/Users/michaeljacinto/Library/CloudStorage/OneDrive-Personal/Desktop/trades"
+        BASE_PATH = BASE_PATH_TRADES
         master_file = os.path.join(BASE_PATH, MASTER_FILE)
         backup_file = os.path.join(BASE_PATH, MASTER_BACKUP)
         
