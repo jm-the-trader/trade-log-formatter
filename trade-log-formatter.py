@@ -1339,6 +1339,86 @@ def update_trades_journal(consolidated_trades, folder_path):
         for rec, _ in other_updates:
             print(f"    • Row {rec['_xlsx_row']} ({rec['Symbol']})")
 
+    # Per-symbol share roll-up — cross-check against master-trades raw counts.
+    from collections import defaultdict
+    closed_by_sym = defaultdict(lambda: {'shares': 0, 'parts': []})
+    opened_by_sym = defaultdict(lambda: {'shares': 0, 'parts': []})
+
+    for rec, _ in newly_closed:
+        try:
+            n = abs(int(rec['Exit Qty']))
+        except (TypeError, ValueError):
+            n = 0
+        closed_by_sym[rec['Symbol']]['shares'] += n
+        closed_by_sym[rec['Symbol']]['parts'].append('in-place close')
+
+    for child in split_children:
+        try:
+            n = abs(int(child['Exit Qty']))
+        except (TypeError, ValueError):
+            n = 0
+        closed_by_sym[child['Symbol']]['shares'] += n
+        closed_by_sym[child['Symbol']]['parts'].append('split lot')
+
+    for rec, before in legacy_avg:
+        try:
+            be_eq = abs(float(before[1]))
+            new_eq = abs(float(rec['Exit Qty']))
+            added = int(round(new_eq - be_eq))
+        except (TypeError, ValueError):
+            added = 0
+        closed_by_sym[rec['Symbol']]['shares'] += added
+        closed_by_sym[rec['Symbol']]['parts'].append('legacy averaged')
+
+    for r in new_day_trades:
+        try:
+            n = abs(int(r['Exit Qty']))
+        except (TypeError, ValueError):
+            n = 0
+        closed_by_sym[r['Symbol']]['shares'] += n
+        closed_by_sym[r['Symbol']]['parts'].append('day-trade')
+
+    for r in new_opens:
+        try:
+            n = abs(int(r['Qty']))
+        except (TypeError, ValueError):
+            n = 0
+        opened_by_sym[r['Symbol']]['shares'] += n
+        opened_by_sym[r['Symbol']]['parts'].append('new open')
+
+    # Day-trades also represent shares opened (they were opened+closed
+    # within this run); list them under opened too for parity with the
+    # broker's raw qty totals.
+    for r in new_day_trades:
+        try:
+            n = abs(int(r['Qty']))
+        except (TypeError, ValueError):
+            n = 0
+        opened_by_sym[r['Symbol']]['shares'] += n
+        opened_by_sym[r['Symbol']]['parts'].append('day-trade')
+
+    def _format_parts(parts):
+        """De-duplicate consecutive part labels with ×N counts."""
+        from collections import Counter
+        counts = Counter(parts)
+        return ', '.join(
+            f"{label} ×{n}" if n > 1 else label for label, n in counts.items()
+        )
+
+    if closed_by_sym or opened_by_sym:
+        print("\n" + "-" * 72)
+        print("📊 PER-SYMBOL SHARE ROLL-UP (cross-check vs master-trades raw qty):")
+        if closed_by_sym:
+            print("  Closed:")
+            for sym in sorted(closed_by_sym.keys()):
+                d = closed_by_sym[sym]
+                print(f"    {sym:<6} {d['shares']:>4} share(s)  ({_format_parts(d['parts'])})")
+        if opened_by_sym:
+            print("  Opened:")
+            for sym in sorted(opened_by_sym.keys()):
+                d = opened_by_sym[sym]
+                print(f"    {sym:<6} {d['shares']:>4} share(s)  ({_format_parts(d['parts'])})")
+
     print("\n" + "-" * 72)
     print(f"Summary: {len(newly_closed)} close(s) in place, "
           f"{len(legacy_avg)} legacy avg(s), "
