@@ -1136,13 +1136,7 @@ def update_trades_journal(consolidated_trades, folder_path):
         print(f"⚠️  {JOURNAL_FILE} not found at {journal_path}; skipping journal update")
         return
 
-    print(f"\n📓 Updating {JOURNAL_FILE} journal...")
-
-    # Backup
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_path = os.path.join(BASE_PATH_TRADES, f'Trades_backup_{ts}.xlsx')
-    shutil.copy(journal_path, backup_path)
-    print(f"📑 Backup: {os.path.basename(backup_path)}")
+    print(f"\n📓 Preparing {JOURNAL_FILE} journal update preview...")
 
     wb = load_workbook(journal_path)
     if JOURNAL_SHEET not in wb.sheetnames:
@@ -1237,6 +1231,132 @@ def update_trades_journal(consolidated_trades, folder_path):
                 in_place_updates.append(r)
         else:
             new_appends.append(r)
+
+    # ---- Preview the planned changes BEFORE any writes ----
+    def _fmt_price(v):
+        try:
+            return f"${float(v):.2f}"
+        except (TypeError, ValueError):
+            return str(v)
+
+    def _fmt_qty(v):
+        try:
+            return str(abs(int(v)))
+        except (TypeError, ValueError):
+            return str(v)
+
+    def _side_label(side_internal):
+        return 'LONG' if side_internal == 'BUY' else ('SHORT' if side_internal == 'SELL' else side_internal)
+
+    print("\n" + "=" * 72)
+    print(f"📋 JOURNAL UPDATE PREVIEW ({JOURNAL_FILE} → sheet '{JOURNAL_SHEET}')")
+    print("=" * 72)
+
+    total = len(in_place_updates) + len(split_children) + len(new_appends)
+    if total == 0:
+        print("  (no changes to apply)")
+        print("=" * 72)
+        return
+
+    # Bucket in_place_updates further:
+    #   newly_closed   = open → closed (snapshot Exit Qty blank, now filled)
+    #   legacy_avg     = legacy partial averaged into a larger Exit Qty
+    #   other_updates  = anything else (rare)
+    newly_closed = []
+    legacy_avg = []
+    other_updates = []
+    for rec in in_place_updates:
+        before = snap_by_xrow.get(rec['_xlsx_row'])
+        if before is None:
+            other_updates.append((rec, before))
+            continue
+        before_eq = before[1]
+        if _is_blank(before_eq):
+            newly_closed.append((rec, before))
+        else:
+            legacy_avg.append((rec, before))
+
+    # New appends split into open vs day-trade-closed-in-run.
+    new_opens = [r for r in new_appends if _is_blank(r.get('Exit Date'))]
+    new_day_trades = [r for r in new_appends if not _is_blank(r.get('Exit Date'))]
+
+    if new_opens:
+        print(f"\n📥 NEW POSITIONS TO OPEN  ({len(new_opens)} row(s) appended):")
+        for r in new_opens:
+            print(f"    • {r['Symbol']:<6} {_side_label(r['Side']):<5} qty {_fmt_qty(r['Qty']):>4}  "
+                  f"@ {_fmt_price(r['Entry Price'])}   entry {r['Entry Date']} {r['Entry Time']}")
+
+    if newly_closed:
+        print(f"\n❎ EXISTING POSITIONS TO CLOSE  ({len(newly_closed)} row(s) updated in place):")
+        for rec, _before in newly_closed:
+            xrow = rec['_xlsx_row']
+            print(f"    • Row {xrow:>3}: {rec['Symbol']:<6} qty {_fmt_qty(rec['Qty']):>4} "
+                  f"entry {_fmt_price(rec['Entry Price']):>9} ({rec['Entry Date']})  →  "
+                  f"exit {_fmt_price(rec['Exit Price']):>9} ({rec['Exit Date']} {rec['Exit Time']})")
+
+    if split_children:
+        print(f"\n✂️  PARTIAL CLOSES — original row reduced, closed lot appended  ({len(split_children)} split(s)):")
+        for child in split_children:
+            parent = child['_xlsx_row']
+            print(f"    • Row {parent:>3} ({child['Symbol']}): split off Qty {_fmt_qty(child['Qty'])} → "
+                  f"new closed-lot row will be appended at Qty {_fmt_qty(child['Qty'])} "
+                  f"@ {_fmt_price(child['Exit Price'])} ({child['Exit Date']}). "
+                  f"Original row reduced; remaining qty stays open.")
+
+    if legacy_avg:
+        print(f"\n🔁 LEGACY PARTIAL EXITS — WEIGHTED-AVERAGED with new fill  ({len(legacy_avg)} row(s)):")
+        for rec, before in legacy_avg:
+            xrow = rec['_xlsx_row']
+            try:
+                be_eq = abs(float(before[1]))
+                be_ep = float(before[2])
+                new_eq = abs(float(rec['Exit Qty']))
+                new_ep = float(rec['Exit Price'])
+                added = new_eq - be_eq
+                # Reverse-engineer the new fill price from the weighted average:
+                #   new_ep = (be_eq*be_ep + added*fill_price) / new_eq
+                fill_price = (new_ep * new_eq - be_eq * be_ep) / added if added else float('nan')
+                line = (f"    • Row {xrow:>3} ({rec['Symbol']}): "
+                        f"existing exit {be_eq:.0f} @ {_fmt_price(be_ep)}  +  new {added:.0f} @ {_fmt_price(fill_price)}  "
+                        f"=  {new_eq:.0f} @ {_fmt_price(new_ep)} (weighted avg)")
+                print(line)
+            except (TypeError, ValueError):
+                print(f"    • Row {xrow} ({rec['Symbol']}): exit fields updated.")
+            if not _is_blank(rec.get('Exit Date')):
+                print(f"        → fully closed; Exit Date = {rec['Exit Date']}")
+            else:
+                print(f"        → still partial; Exit Date left blank.")
+
+    if new_day_trades:
+        print(f"\n⚡ DAY-TRADES (opened and closed in this run, appended)  ({len(new_day_trades)} row(s)):")
+        for r in new_day_trades:
+            print(f"    • {r['Symbol']:<6} qty {_fmt_qty(r['Qty']):>4}  "
+                  f"entry {_fmt_price(r['Entry Price'])} ({r['Entry Date']})  →  "
+                  f"exit {_fmt_price(r['Exit Price'])} ({r['Exit Date']})")
+
+    if other_updates:
+        print(f"\nℹ️  OTHER UPDATES  ({len(other_updates)} row(s)):")
+        for rec, _ in other_updates:
+            print(f"    • Row {rec['_xlsx_row']} ({rec['Symbol']})")
+
+    print("\n" + "-" * 72)
+    print(f"Summary: {len(newly_closed)} close(s) in place, "
+          f"{len(legacy_avg)} legacy avg(s), "
+          f"{len(split_children)} split(s), "
+          f"{len(new_opens)} new open(s), "
+          f"{len(new_day_trades)} day-trade(s).")
+    print("-" * 72)
+
+    answer = input("Apply these changes to Trades.xlsx? (y/N): ").strip().lower()
+    if answer != 'y':
+        print("⏭️  Skipped journal update — no changes written.")
+        return
+
+    # Confirmed — create backup now and proceed with writes.
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_path = os.path.join(BASE_PATH_TRADES, f'Trades_backup_{ts}.xlsx')
+    shutil.copy(journal_path, backup_path)
+    print(f"📑 Backup: {os.path.basename(backup_path)}")
 
     # Helpers
     def journal_side(side_internal, original=None):
