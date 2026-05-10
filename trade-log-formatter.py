@@ -474,8 +474,12 @@ def _row_state(row):
     return 'open'
 
 
-def match_trades_fifo(df_master, consolidated_trades):
-    """Match new consolidated trades against existing master rows using FIFO.
+def _match_trades_fifo_records(rows, consolidated_trades):
+    """Core FIFO matcher operating on a list of dict records.
+
+    Each input row may carry arbitrary extra keys beyond the FIFO fields;
+    those keys are preserved on outputs (used for lineage tracking when
+    writing back to user spreadsheets).
 
     Existing rows fall into three buckets:
       - closed:         Exit Qty + Exit Date both filled. Left untouched.
@@ -489,22 +493,7 @@ def match_trades_fifo(df_master, consolidated_trades):
     Any new trade quantity that doesn't match an opposite-side open row
     becomes a new open BUY/SELL row.
     """
-    columns = [
-        "Symbol", "Qty", "Side", "Entry Price", "Entry Time",
-        "Entry Date", "Notes", "Exit Qty", "Exit Price",
-        "Exit Time", "Exit Date",
-    ]
-
-    if df_master is None or df_master.empty:
-        rows = []
-    else:
-        df_clean = df_master[[c for c in columns if c in df_master.columns]].copy()
-        for c in columns:
-            if c not in df_clean.columns:
-                df_clean[c] = None
-        rows = df_clean.to_dict('records')
-
-    # Normalize legacy 'LONG'/'SHORT' to 'BUY'/'SELL' for the master sheet.
+    # Normalize 'LONG'/'SHORT' to 'BUY'/'SELL' for matching.
     for r in rows:
         if r.get('Side') == 'LONG':
             r['Side'] = 'BUY'
@@ -604,6 +593,7 @@ def match_trades_fifo(df_master, consolidated_trades):
                     closed_lot['Exit Price'] = price
                     closed_lot['Exit Time'] = time
                     closed_lot['Exit Date'] = date
+                    closed_lot['_split_child'] = True  # lineage flag for journal writer
                     rows.append(closed_lot)
                     r['Qty'] = row_sign * (row_qty - fill)
                     print(f"  → split lot {symbol}: closed {fill}, {row_qty - fill} still open")
@@ -630,6 +620,31 @@ def match_trades_fifo(df_master, consolidated_trades):
             queues[symbol].append(new_idx)
             print(f"  → opened new {new_row_side} {remaining} {symbol}")
 
+    return rows
+
+
+def match_trades_fifo(df_master, consolidated_trades):
+    """DataFrame wrapper around `_match_trades_fifo_records` for the
+    master-trades.xlsx schema. Drops any extra columns to keep the master
+    sheet clean.
+    """
+    columns = [
+        "Symbol", "Qty", "Side", "Entry Price", "Entry Time",
+        "Entry Date", "Notes", "Exit Qty", "Exit Price",
+        "Exit Time", "Exit Date",
+    ]
+
+    if df_master is None or df_master.empty:
+        rows = []
+    else:
+        df_clean = df_master[[c for c in columns if c in df_master.columns]].copy()
+        for c in columns:
+            if c not in df_clean.columns:
+                df_clean[c] = None
+        rows = df_clean.to_dict('records')
+
+    rows = _match_trades_fifo_records(rows, consolidated_trades)
+
     df_result = pd.DataFrame(rows, columns=columns)
     if not df_result.empty:
         df_result['_dt'] = pd.to_datetime(
@@ -638,6 +653,7 @@ def match_trades_fifo(df_master, consolidated_trades):
         )
         df_result = df_result.sort_values('_dt', kind='stable').drop(columns='_dt').reset_index(drop=True)
     return df_result
+
 
 def update_master_sheet(consolidated_trades, folder_path):
     """Update master balance sheet with new trades after backing up"""
@@ -1063,6 +1079,326 @@ def reset_master_sheet():
     except Exception as e:
         print(f"❌ Error during reset: {str(e)}")
 
+JOURNAL_FILE = "Trades.xlsx"
+JOURNAL_SHEET = "Trades"
+# Columns FIFO automation manages directly. All other columns (Setup,
+# Entry Notes, Stop Price, Target Price, P/L formulas, etc.) are preserved
+# untouched on existing rows; on new rows they are left blank, but cells
+# containing formulas are copied from the previous row so drag-down stays
+# intact.
+_JOURNAL_FIFO_COLS = {
+    "Symbol", "Qty", "Side", "Entry Price", "Entry Time", "Entry Date",
+    "Exit Qty", "Exit Price", "Exit Time", "Exit Date",
+}
+
+
+def _journal_normalize_date(v):
+    """Normalize an Excel cell value to an ISO date string for FIFO comparison."""
+    if v is None or v == '':
+        return None
+    if isinstance(v, datetime):
+        return v.strftime('%Y-%m-%d')
+    if hasattr(v, 'strftime'):  # date or Timestamp
+        try:
+            return v.strftime('%Y-%m-%d')
+        except Exception:
+            pass
+    return str(v).split(' ')[0]
+
+
+def _journal_normalize_time(v):
+    if v is None or v == '':
+        return None
+    if hasattr(v, 'strftime'):
+        try:
+            return v.strftime('%H:%M:%S')
+        except Exception:
+            pass
+    return str(v)
+
+
+def update_trades_journal(consolidated_trades, folder_path):
+    """Apply FIFO matching to user's Trades.xlsx journal in place, preserving
+    formulas and custom columns (Setup, Notes, Stop/Target, P/L, etc.).
+
+    For existing rows: closes are written into Exit Qty/Price/Time/Date.
+    Open rows that receive a partial close are split into a closed lot row
+    (appended) plus the original row with Qty reduced by the fill.
+    Brand-new entries with no opposite-side open lot become appended rows.
+    """
+    import shutil
+    from openpyxl import load_workbook
+    from openpyxl.formula.translate import Translator
+    from openpyxl.worksheet.formula import ArrayFormula
+
+    journal_path = os.path.join(BASE_PATH_TRADES, JOURNAL_FILE)
+    if not os.path.exists(journal_path):
+        print(f"⚠️  {JOURNAL_FILE} not found at {journal_path}; skipping journal update")
+        return
+
+    print(f"\n📓 Updating {JOURNAL_FILE} journal...")
+
+    # Backup
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_path = os.path.join(BASE_PATH_TRADES, f'Trades_backup_{ts}.xlsx')
+    shutil.copy(journal_path, backup_path)
+    print(f"📑 Backup: {os.path.basename(backup_path)}")
+
+    wb = load_workbook(journal_path)
+    if JOURNAL_SHEET not in wb.sheetnames:
+        print(f"⚠️ '{JOURNAL_SHEET}' sheet not found in {JOURNAL_FILE}; skipping")
+        return
+    ws = wb[JOURNAL_SHEET]
+
+    # Map first occurrence of each header to its column index. Duplicates
+    # (file has a stray second 'Symbol' column with broken array formulas)
+    # are left strictly alone.
+    headers = {}
+    duplicates = set()
+    for idx, c in enumerate(ws[1], 1):
+        h = c.value
+        if h is None or h == '':
+            continue
+        if h in headers:
+            duplicates.add(idx)
+            continue
+        headers[h] = idx
+    required = ['Symbol', 'Qty', 'Side', 'Entry Price', 'Entry Time', 'Entry Date',
+                'Exit Qty', 'Exit Price', 'Exit Time', 'Exit Date']
+    missing = [c for c in required if c not in headers]
+    if missing:
+        print(f"⚠️ Missing required columns in {JOURNAL_SHEET} sheet: {missing}; skipping")
+        return
+
+    # Find true last data row (last row with a non-empty Symbol).
+    last_row = 1
+    for r in range(2, ws.max_row + 1):
+        if ws.cell(row=r, column=headers['Symbol']).value not in (None, ''):
+            last_row = r
+
+    # Read existing rows into FIFO records.
+    fifo_rows = []
+    for r in range(2, last_row + 1):
+        sym = ws.cell(row=r, column=headers['Symbol']).value
+        if sym in (None, ''):
+            continue
+        rec = {
+            'Symbol': sym,
+            'Qty': ws.cell(row=r, column=headers['Qty']).value,
+            'Side': ws.cell(row=r, column=headers['Side']).value,
+            'Entry Price': ws.cell(row=r, column=headers['Entry Price']).value,
+            'Entry Time': _journal_normalize_time(ws.cell(row=r, column=headers['Entry Time']).value),
+            'Entry Date': _journal_normalize_date(ws.cell(row=r, column=headers['Entry Date']).value),
+            'Notes': '',
+            'Exit Qty': ws.cell(row=r, column=headers['Exit Qty']).value,
+            'Exit Price': ws.cell(row=r, column=headers['Exit Price']).value,
+            'Exit Time': _journal_normalize_time(ws.cell(row=r, column=headers['Exit Time']).value),
+            'Exit Date': _journal_normalize_date(ws.cell(row=r, column=headers['Exit Date']).value),
+            '_xlsx_row': r,
+        }
+        fifo_rows.append(rec)
+
+    pre_count = len(fifo_rows)
+    # Snapshot the FIFO-managed fields of each existing row so we can detect
+    # which ones FIFO actually mutated (avoid pointless writes that could
+    # nudge cell formatting).
+    snapshot = {
+        id(r): (r.get('Qty'), r.get('Exit Qty'), r.get('Exit Price'),
+                r.get('Exit Time'), r.get('Exit Date'))
+        for r in fifo_rows
+    }
+    snap_by_xrow = {r['_xlsx_row']: snapshot[id(r)] for r in fifo_rows}
+
+    out_rows = _match_trades_fifo_records(fifo_rows, consolidated_trades)
+
+    def is_dirty(rec):
+        xrow = rec.get('_xlsx_row')
+        if xrow not in snap_by_xrow:
+            return True
+        before = snap_by_xrow[xrow]
+        after = (rec.get('Qty'), rec.get('Exit Qty'), rec.get('Exit Price'),
+                 rec.get('Exit Time'), rec.get('Exit Date'))
+        return before != after
+
+    # Categorize output rows for write-back:
+    #   - in_place_updates: existing rows whose FIFO fields changed
+    #   - split_children:   newly-created lots (must be appended, inherit
+    #                       static cols + formulas from parent's xlsx row)
+    #   - new_appends:      brand-new entries (no parent row; only formulas
+    #                       are inherited from the prior journal row)
+    in_place_updates = []
+    split_children = []
+    new_appends = []
+    for r in out_rows:
+        if r.get('_split_child'):
+            split_children.append(r)
+        elif r.get('_xlsx_row'):
+            if is_dirty(r):
+                in_place_updates.append(r)
+        else:
+            new_appends.append(r)
+
+    # Helpers
+    def journal_side(side_internal, original=None):
+        """Convert internal BUY/SELL to LONG/SHORT, or fall back to whatever
+        the user had on the original row."""
+        if original is not None and original.get('Side') in ('LONG', 'SHORT'):
+            # Prefer to keep whatever convention the user already uses.
+            pass
+        if side_internal == 'BUY':
+            return 'LONG'
+        if side_internal == 'SELL':
+            return 'SHORT'
+        return side_internal
+
+    def write_fifo_fields(target_row, rec):
+        """Write only the FIFO-managed fields onto the given xlsx row."""
+        ws.cell(row=target_row, column=headers['Symbol']).value = rec['Symbol']
+        # Store Qty as positive integer in journal (user convention: LONG/SHORT
+        # carries the direction; Qty is magnitude).
+        qv = rec.get('Qty')
+        if qv is not None:
+            ws.cell(row=target_row, column=headers['Qty']).value = abs(int(qv))
+        ws.cell(row=target_row, column=headers['Side']).value = journal_side(rec.get('Side'))
+        ws.cell(row=target_row, column=headers['Entry Price']).value = rec.get('Entry Price')
+        ws.cell(row=target_row, column=headers['Entry Time']).value = rec.get('Entry Time')
+        ed = rec.get('Entry Date')
+        ws.cell(row=target_row, column=headers['Entry Date']).value = (
+            datetime.strptime(ed, '%Y-%m-%d') if isinstance(ed, str) else ed
+        )
+
+        eq = rec.get('Exit Qty')
+        if eq is None or (isinstance(eq, float) and pd.isna(eq)):
+            ws.cell(row=target_row, column=headers['Exit Qty']).value = None
+        else:
+            ws.cell(row=target_row, column=headers['Exit Qty']).value = abs(int(eq)) if isinstance(eq, (int, float)) and not pd.isna(eq) else eq
+        ws.cell(row=target_row, column=headers['Exit Price']).value = rec.get('Exit Price')
+        ws.cell(row=target_row, column=headers['Exit Time']).value = rec.get('Exit Time')
+        xd = rec.get('Exit Date')
+        if xd is None or (isinstance(xd, float) and pd.isna(xd)):
+            ws.cell(row=target_row, column=headers['Exit Date']).value = None
+        else:
+            ws.cell(row=target_row, column=headers['Exit Date']).value = (
+                datetime.strptime(xd, '%Y-%m-%d') if isinstance(xd, str) else xd
+            )
+
+    # For each column, find the most recent row (<= last_row) that contains
+    # a formula in that column. Used as the translation source so we always
+    # pull from a closed-lot template even when nearby rows are open.
+    formula_src_for_col = {}
+    for col_idx in range(1, ws.max_column + 1):
+        if col_idx in duplicates:
+            continue
+        for r in range(last_row, 1, -1):
+            v = ws.cell(row=r, column=col_idx).value
+            if isinstance(v, str) and v.startswith('='):
+                formula_src_for_col[col_idx] = r
+                break
+
+    def _translate_formula_into(col_idx, dst_row):
+        """Pull the latest formula in col_idx, translate to dst_row, write."""
+        src_r = formula_src_for_col.get(col_idx)
+        if not src_r or src_r == dst_row:
+            return
+        src_cell = ws.cell(row=src_r, column=col_idx)
+        v = src_cell.value
+        if not (isinstance(v, str) and v.startswith('=')):
+            return
+        try:
+            new_f = Translator(v, origin=src_cell.coordinate).translate_formula(
+                ws.cell(row=dst_row, column=col_idx).coordinate
+            )
+            ws.cell(row=dst_row, column=col_idx).value = new_f
+        except Exception:
+            pass
+
+    def copy_static_columns(src_row, dst_row):
+        """For split-children: copy non-FIFO columns from parent row.
+        - Plain text/number values are copied as-is (Setup, Notes, etc.).
+        - Formula cells are translated to dst_row.
+        - Cells blank on parent get a formula filled in if any prior row has
+          one for that column (so closed split-children get P/L formulas
+          even when parent was an open row with blank P/L).
+        - Array formulas and duplicate-header columns are skipped.
+        """
+        for col_idx in range(1, ws.max_column + 1):
+            if col_idx in duplicates:
+                continue
+            header_name = ws.cell(row=1, column=col_idx).value
+            if header_name in _JOURNAL_FIFO_COLS:
+                continue
+            src_cell = ws.cell(row=src_row, column=col_idx)
+            v = src_cell.value
+            if isinstance(v, ArrayFormula):
+                continue
+            if isinstance(v, str) and v.startswith('='):
+                try:
+                    new_f = Translator(v, origin=src_cell.coordinate).translate_formula(
+                        ws.cell(row=dst_row, column=col_idx).coordinate
+                    )
+                    ws.cell(row=dst_row, column=col_idx).value = new_f
+                except Exception:
+                    pass
+            elif v is not None:
+                ws.cell(row=dst_row, column=col_idx).value = v
+            else:
+                _translate_formula_into(col_idx, dst_row)
+
+    def add_formulas_for_close(dst_row):
+        """For newly-closed rows (in-place close transition or split-child):
+        fill in formula columns that are currently blank, pulled from the
+        latest-formula source row for each column."""
+        for col_idx in formula_src_for_col:
+            header_name = ws.cell(row=1, column=col_idx).value
+            if header_name in _JOURNAL_FIFO_COLS:
+                continue
+            target = ws.cell(row=dst_row, column=col_idx)
+            if target.value in (None, ''):
+                _translate_formula_into(col_idx, dst_row)
+
+    next_append = last_row + 1
+    n_updates = n_splits = n_new = 0
+
+    for rec in in_place_updates:
+        xrow = rec['_xlsx_row']
+        before = snap_by_xrow.get(xrow, (None,) * 5)
+        was_open_pre = _is_blank(before[3]) and _is_blank(before[4])  # Exit Time + Exit Date blank
+        write_fifo_fields(xrow, rec)
+        # If this row just transitioned to closed (Exit Date now filled),
+        # add P/L (and any other formula columns) that were blank.
+        if was_open_pre and not _is_blank(rec.get('Exit Date')):
+            add_formulas_for_close(xrow)
+        n_updates += 1
+
+    for child in split_children:
+        parent_row = child['_xlsx_row']
+        copy_static_columns(parent_row, next_append)
+        write_fifo_fields(next_append, child)
+        # Split-children are always closed lots; ensure formulas exist.
+        add_formulas_for_close(next_append)
+        next_append += 1
+        n_splits += 1
+
+    for rec in new_appends:
+        write_fifo_fields(next_append, rec)
+        # Open-and-closed-in-same-run case (e.g. day-trade): Exit Date is
+        # already filled, so populate formula columns. Otherwise leave
+        # blank — user fills them on close (matching the drag-down workflow).
+        if not _is_blank(rec.get('Exit Date')):
+            add_formulas_for_close(next_append)
+        next_append += 1
+        n_new += 1
+
+    wb.save(journal_path)
+    print(
+        f"✅ Updated {JOURNAL_FILE}: "
+        f"{n_updates} row(s) updated in place, "
+        f"{n_splits} split-child row(s) appended, "
+        f"{n_new} new entry row(s) appended."
+    )
+    print(f"   - Journal had {pre_count} data rows; now has {next_append - 2} data rows.")
+
+
 def process_folder(date_str):
     """Process a single folder based on date string"""
     try:
@@ -1087,9 +1423,13 @@ def process_folder(date_str):
         print(f"   - Total individual trades: {len(all_trades)}")
         print(f"   - Consolidated trades: {len(consolidated_trades)}")
         
-        # Update master sheet with consolidated trades
+        # Update master sheet with consolidated trades (audit trail).
         update_master_sheet(consolidated_trades, folder_path)
-        
+
+        # Update the user's Trades.xlsx journal with FIFO matching applied
+        # in-place (preserves formulas and custom columns).
+        update_trades_journal(consolidated_trades, folder_path)
+
         # Check and display open positions
         check_open_positions(folder_path)
         
